@@ -1,0 +1,501 @@
+# Copyright 2021 AlQuraishi Laboratory
+# Copyright 2021 DeepMind Technologies Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+import warnings
+from typing import Callable, List, Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from torch import nn
+
+from boltz.model.layers import initialize
+from boltz.model.modules.utils import autocast_device_type
+from boltz.model.layers.triangular_attention.utils import (
+    flatten_final_dims,
+    permute_final_dims,
+)
+
+
+class Linear(nn.Linear):
+    """
+    A Linear layer with built-in nonstandard initializations. Called just
+    like torch.nn.Linear.
+
+    Implements the initializers in 1.11.4, plus some additional ones found
+    in the code.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        bias: bool = True,
+        init: str = "default",
+        init_fn: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
+        precision=None,
+    ):
+        """Initialize the linear layer.
+
+        Parameters
+        ----------
+        in_dim : int
+            The final dimension of inputs to the layer
+        out_dim : int
+            The final dimension of layer outputs
+        bias : bool, default=True
+            Whether to learn an additive bias
+        init : str, default='default'
+            The initializer to use. Choose from:
+
+            - "default": LeCun fan-in truncated normal initialization
+            - "relu": He initialization w/ truncated normal distribution
+            - "glorot": Fan-average Glorot uniform initialization
+            - "gating": Weights=0, Bias=1
+            - "normal": Normal initialization with std=1/sqrt(fan_in)
+            - "final": Weights=0, Bias=0
+
+            Overridden by init_fn if the latter is not None.
+        init_fn : callable, optional
+            A custom initializer taking weight and bias as inputs.
+            Overrides init if not None.
+
+        """
+        super().__init__(in_dim, out_dim, bias=bias)
+
+        if bias:
+            with torch.no_grad():
+                self.bias.fill_(0)
+
+        with torch.no_grad():
+            if init_fn is not None:
+                init_fn(self.weight, self.bias)
+            else:
+                if init == "default":
+                    initialize.lecun_normal_init_(self.weight)
+                elif init == "relu":
+                    initialize.he_normal_init_(self.weight)
+                elif init == "glorot":
+                    initialize.glorot_uniform_init_(self.weight)
+                elif init == "gating":
+                    initialize.gating_init_(self.weight)
+                    if bias:
+                        self.bias.fill_(1.0)
+                elif init == "normal":
+                    initialize.normal_init_(self.weight)
+                elif init == "final":
+                    initialize.final_init_(self.weight)
+                else:
+                    raise ValueError("Invalid init string.")
+
+        self.precision = precision
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        d = input.dtype
+        if self.precision is not None:
+            with torch.autocast(autocast_device_type(input.device.type), enabled=False):
+                bias = (
+                    self.bias.to(dtype=self.precision)
+                    if self.bias is not None
+                    else None
+                )
+                return nn.functional.linear(
+                    input.to(dtype=self.precision),
+                    self.weight.to(dtype=self.precision),
+                    bias,
+                ).to(dtype=d)
+
+        if d is torch.bfloat16:
+            with torch.autocast(autocast_device_type(input.device.type), enabled=False):
+                bias = self.bias.to(dtype=d) if self.bias is not None else None
+                return nn.functional.linear(input, self.weight.to(dtype=d), bias)
+
+        return nn.functional.linear(input, self.weight, self.bias)
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, c_in, eps=1e-5):
+        super(LayerNorm, self).__init__()
+
+        self.c_in = (c_in,)
+        self.eps = eps
+
+        self.weight = nn.Parameter(torch.ones(c_in))
+        self.bias = nn.Parameter(torch.zeros(c_in))
+
+    def forward(self, x):
+        d = x.dtype
+        if d is torch.bfloat16:
+            with torch.autocast(autocast_device_type(x.device.type), enabled=False):
+                out = nn.functional.layer_norm(
+                    x,
+                    self.c_in,
+                    self.weight.to(dtype=d),
+                    self.bias.to(dtype=d),
+                    self.eps,
+                )
+        else:
+            out = nn.functional.layer_norm(
+                x,
+                self.c_in,
+                self.weight,
+                self.bias,
+                self.eps,
+            )
+
+        return out
+
+
+@torch.jit.ignore
+def softmax_no_cast(t: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Softmax, but without automatic casting to fp32 when the input is of
+    type bfloat16
+    """
+    d = t.dtype
+    if d is torch.bfloat16:
+        with torch.autocast(autocast_device_type(t.device.type), enabled=False):
+            s = torch.nn.functional.softmax(t, dim=dim)
+    else:
+        s = torch.nn.functional.softmax(t, dim=dim)
+
+    return s
+
+
+# @torch.jit.script
+def _attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    biases: List[torch.Tensor],
+) -> torch.Tensor:
+    # [*, H, C_hidden, K]
+    key = permute_final_dims(key, (1, 0))
+
+    # [*, H, Q, K]
+    a = torch.matmul(query, key)
+
+    for b in biases:
+        a += b
+
+    a = softmax_no_cast(a, -1)
+
+    # [*, H, Q, C_hidden]
+    a = torch.matmul(a, value)
+
+    return a
+
+
+def _attention_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    biases: List[torch.Tensor],
+) -> torch.Tensor:
+    """Memory-efficient attention using PyTorch SDPA (FlashAttention-2 backend).
+
+    Accepts q/k/v in shape [*, H, Q/K, C_hidden] (same as ``_attention``).
+    Biases may be broadcast-shaped tensors that expand to [*, H, Q, K].
+
+    The q tensor is pre-scaled by 1/sqrt(c_hidden) before being passed here,
+    so we use scale=1.0 in SDPA to avoid double-scaling.
+    """
+    # Flatten all leading batch dimensions into one so SDPA sees a 4-D tensor.
+    *batch_dims, H, N_q, D = query.shape
+    N_k = key.shape[-2]
+    B_eff = math.prod(batch_dims) if batch_dims else 1
+
+    q = query.reshape(B_eff, H, N_q, D)
+    k = key.reshape(B_eff, H, N_k, D)
+    v = value.reshape(B_eff, H, N_k, D)
+
+    # Biases may have broadcast shapes (e.g. (B, I, 1, 1, J) for a mask or
+    # (B, 1, H, I, J) for the triangle bias).  Sum them first while allowing
+    # PyTorch to handle the broadcasting, then reshape the fully-expanded
+    # result to (B_eff, H, N_q, N_k) for SDPA.
+    attn_bias: Optional[torch.Tensor] = None
+    if biases:
+        combined = biases[0]
+        for b in biases[1:]:
+            combined = combined + b          # broadcast sum over all biases
+        attn_bias = combined.reshape(B_eff, H, N_q, N_k)
+
+    # scale=1.0 because q is already divided by sqrt(c_hidden).
+    o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, scale=1.0)
+    return o.reshape(*batch_dims, H, N_q, D)
+
+
+@torch.compiler.disable
+def kernel_triangular_attn(q, k, v, tri_bias, mask, scale):
+    from cuequivariance_torch.primitives.triangle import triangle_attention
+    return triangle_attention(q, k, v, tri_bias, mask=mask, scale=scale)
+
+
+# Once the cuequivariance triangle attention op fails, skip the kernel path for
+# the rest of the process to avoid repeatedly raising and warning on the same
+# unavailable op.
+_kernel_failure = {"reason": None}
+
+
+def _is_recoverable_kernel_error(error: Exception) -> bool:
+    if isinstance(error, ImportError):
+        return True
+    msg = str(error)
+    return (
+        "triangle_attention" in msg
+        and (
+            "Failed to import Triton-based component" in msg
+            or "Not Supported" in msg
+        )
+    )
+
+
+def _kernel_or_none(**kwargs: object) -> Optional[torch.Tensor]:
+    if _kernel_failure["reason"] is not None:
+        return None
+    try:
+        return kernel_triangular_attn(**kwargs)
+    except Exception as error:  # noqa: BLE001
+        if not _is_recoverable_kernel_error(error):
+            raise
+        _kernel_failure["reason"] = str(error)
+        warnings.warn(
+            "Triangle attention kernels are unavailable; falling back to "
+            f"the PyTorch implementation. Kernel error: {_kernel_failure['reason']}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return None
+
+
+class Attention(nn.Module):
+    """
+    Standard multi-head attention using AlphaFold's default layer
+    initialization. Allows multiple bias vectors.
+    """
+
+    def __init__(
+        self,
+        c_q: int,
+        c_k: int,
+        c_v: int,
+        c_hidden: int,
+        no_heads: int,
+        gating: bool = True,
+    ):
+        """Initialize the attention layer.
+
+        Parameters
+        ----------
+        c_q : int
+            Input dimension of query data
+        c_k : int
+            Input dimension of key data
+        c_v : int
+            Input dimension of value data
+        c_hidden : int
+            Per-head hidden dimension
+        no_heads : int
+            Number of attention heads
+        gating : bool, default=True
+            Whether the output should be gated using query data
+
+        """
+        super().__init__()
+
+        self.c_q = c_q
+        self.c_k = c_k
+        self.c_v = c_v
+        self.c_hidden = c_hidden
+        self.no_heads = no_heads
+        self.gating = gating
+
+        # DISCREPANCY: c_hidden is not the per-head channel dimension, as
+        # stated in the supplement, but the overall channel dimension.
+
+        self.linear_q = Linear(
+            self.c_q, self.c_hidden * self.no_heads, bias=False, init="glorot"
+        )
+        self.linear_k = Linear(
+            self.c_k, self.c_hidden * self.no_heads, bias=False, init="glorot"
+        )
+        self.linear_v = Linear(
+            self.c_v, self.c_hidden * self.no_heads, bias=False, init="glorot"
+        )
+        self.linear_o = Linear(
+            self.c_hidden * self.no_heads, self.c_q, bias=False, init="final"
+        )
+
+        self.linear_g = None
+        if self.gating:
+            self.linear_g = Linear(
+                self.c_q, self.c_hidden * self.no_heads, bias=False, init="gating"
+            )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def _prep_qkv(
+        self, q_x: torch.Tensor, kv_x: torch.Tensor, apply_scale: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [*, Q/K/V, H * C_hidden]
+        q = self.linear_q(q_x)
+        k = self.linear_k(kv_x)
+        v = self.linear_v(kv_x)
+
+        # [*, Q/K, H, C_hidden]
+        q = q.view(q.shape[:-1] + (self.no_heads, -1))
+        k = k.view(k.shape[:-1] + (self.no_heads, -1))
+        v = v.view(v.shape[:-1] + (self.no_heads, -1))
+
+        # [*, H, Q/K, C_hidden]
+        q = q.transpose(-2, -3)
+        k = k.transpose(-2, -3)
+        v = v.transpose(-2, -3)
+
+        if apply_scale:
+            q /= math.sqrt(self.c_hidden)
+
+        return q, k, v
+
+    def _wrap_up(self, o: torch.Tensor, q_x: torch.Tensor) -> torch.Tensor:
+        if self.linear_g is not None:
+            g = self.sigmoid(self.linear_g(q_x))
+
+            # [*, Q, H, C_hidden]
+            g = g.view(g.shape[:-1] + (self.no_heads, -1))
+            o = o * g
+
+        # [*, Q, H * C_hidden]
+        o = flatten_final_dims(o, 2)
+
+        # [*, Q, C_q]
+        o = self.linear_o(o)
+
+        return o
+
+    def forward(
+        self,
+        q_x: torch.Tensor,
+        kv_x: torch.Tensor,
+        tri_bias: torch.Tensor,
+        mask_bias: torch.Tensor,
+        mask: torch.Tensor,
+        use_kernels: bool = False,
+        use_sdpa: bool = False,
+    ) -> torch.Tensor:
+        """Compute attention.
+
+        Parameters
+        ----------
+        q_x : torch.Tensor
+            [*, Q, C_q] query data
+        kv_x : torch.Tensor
+            [*, K, C_k] key data
+        tri_bias : torch.Tensor
+            [*, H, Q, K] triangular bias
+        mask_bias : torch.Tensor
+            [*, H, Q, K] mask bias
+        mask : torch.Tensor
+            [*, Q, K] mask
+        use_kernels : bool, default=False
+            Whether to use optimized CUDA kernels (cuequivariance)
+        use_sdpa : bool, default=False
+            Whether to use PyTorch scaled_dot_product_attention (FlashAttention-2
+            / memory-efficient attention) instead of the manual einsum path.
+
+        Returns
+        -------
+            [*, Q, C_q] attention update
+
+        """
+        # The kernel handles scaling internally; both the standard and SDPA paths
+        # expect q to be pre-divided by sqrt(c_hidden) (apply_scale=True).
+        apply_scale = not use_kernels
+        q, k, v = self._prep_qkv(q_x, kv_x, apply_scale=apply_scale)
+
+        o = None
+        if use_kernels:
+            scale = 1.0 / math.sqrt(self.c_hidden)
+            o = _kernel_or_none(
+                q=q,
+                k=k,
+                v=v,
+                tri_bias=tri_bias,
+                mask=mask.bool(),
+                scale=scale,
+            )
+            if o is None:
+                # Kernel unavailable: q was not pre-scaled, so apply scale now
+                # before falling back to the PyTorch path.
+                q = q * scale
+
+        if o is None:
+            biases = [mask_bias, tri_bias]
+            if use_sdpa:
+                # q is pre-scaled (either by _prep_qkv when use_kernels=False,
+                # or by the fallback branch above), so pass scale=1.0 in SDPA.
+                o = _attention_sdpa(q, k, v, biases)
+            else:
+                o = _attention(q, k, v, biases)
+
+        o = o.transpose(-2, -3)
+
+        o = self._wrap_up(o, q_x)
+
+        return o
+
+
+def _trifast_attn(q, k, v, biases):
+    orig_n_dims = len(q.shape)
+
+    if len(biases) != 2:
+        raise ValueError(f"Trifast expects two bias terms, found {len(biases)}")
+
+    mask, b = biases
+
+    if len(b.shape) == 5:
+        # Sometimes there is an extra batch dim -- why?
+        b = b.squeeze(1)
+
+    if orig_n_dims == 4:
+        # add fake batch dim
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        # b = b.unsqueeze(0) not sure why this and only this has a batch dim?
+        mask = mask.unsqueeze(0)
+
+    if len(q.shape) != 5:
+        raise ValueError(f"Trifast expects q/k/v to be 5D, found {len(q.shape)}")
+
+    # Reorder q/k/v
+    q = rearrange(q, "b i h j d -> b h i j d")
+    k = rearrange(k, "b i h j d -> b h i j d")
+    v = rearrange(v, "b i h j d -> b h i j d")
+
+    # Make mask the right shape.
+    mask = rearrange(mask, "b i () () j -> b i j").bool()
+
+    # Delay import to here to avoid initializing cuda too early
+    from trifast import triangle_attention
+
+    o = triangle_attention(q, k, v, b, mask)
+    o = rearrange(o, "b h i j d -> b i j h d")
+
+    # Remove the batch dim if we added it.
+    if orig_n_dims == 4:
+        o = o.squeeze(0)
+    return o
