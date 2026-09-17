@@ -1,0 +1,11 @@
+version: 1
+sequences:
+- protein:
+    id: A
+    sequence: ''
+- ligand:
+    id: B
+    smiles: CCOc1c(c(cc(n1)NC(=O)Cc2cc(ccc2OC)OC)N)C#N
+properties:
+- affinity:
+    binder: B

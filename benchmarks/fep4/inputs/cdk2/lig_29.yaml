@@ -1,0 +1,11 @@
+version: 1
+sequences:
+- protein:
+    id: A
+    sequence: ''
+- ligand:
+    id: B
+    smiles: '[H]c1c(c(c(c(c1N([H])c2nc3c(c(n2)OC([H])([H])C4(C(C(C(C(C4([H])[H])([H])[H])([H])[H])([H])[H])([H])[H])[H])N=C(N3[H])[H])[H])[H])S(=O)(=O)N(C([H])([H])[H])C([H])([H])[H])[H]'
+properties:
+- affinity:
+    binder: B
