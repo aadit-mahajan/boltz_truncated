@@ -11,3 +11,8 @@ units, but individual assay values should be compared within target/assay.
 
 This is a reproducible public reconstruction, not an official Boltz-held-out
 archive: the official exact split was not released with the model.
+
+Protein sequences are taken from the reference RCSB structures used by the
+four systems: CDK2 1H1Q, TYK2 4GIH, JNK1 2GMX, and p38 3FLY. They are embedded
+in the generated YAMLs because the upstream PLB protein coordinate files use
+Git LFS and are not present in a plain Git archive.
