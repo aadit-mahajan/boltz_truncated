@@ -34,6 +34,7 @@ from boltz.model.modules.utils import (
     log,
 )
 from boltz.model.potentials.potentials import get_potentials
+from boltz.opt import enabled
 
 
 def _get_sample_id_chunks(
@@ -143,19 +144,33 @@ class DiffusionModule(Module):
         feats,
         diffusion_conditioning,
         multiplicity=1,
+        use_flash_attn=False,
+        s_embedded=None,
+        step_cache=None,
     ):
+        # s_embedded is SingleConditioning's noise-independent half. The
+        # sampler computes it once per distinct sample-chunk width, already
+        # replicated, so this call sees the same tensor every step.
+        if s_embedded is None:
+            s_trunk_rep = s_trunk.repeat_interleave(multiplicity, 0)
+            s_inputs_rep = s_inputs.repeat_interleave(multiplicity, 0)
+        else:
+            s_trunk_rep = s_inputs_rep = None
+
         if self.activation_checkpointing and self.training:
             s, normed_fourier = torch.utils.checkpoint.checkpoint(
                 self.single_conditioner,
                 times,
-                s_trunk.repeat_interleave(multiplicity, 0),
-                s_inputs.repeat_interleave(multiplicity, 0),
+                s_trunk_rep,
+                s_inputs_rep,
+                s_embedded,
             )
         else:
             s, normed_fourier = self.single_conditioner(
                 times,
-                s_trunk.repeat_interleave(multiplicity, 0),
-                s_inputs.repeat_interleave(multiplicity, 0),
+                s_trunk_rep,
+                s_inputs_rep,
+                s_embedded,
             )
 
         # Sequence-local Atom Attention and aggregation to coarse-grained tokens
@@ -167,6 +182,8 @@ class DiffusionModule(Module):
             to_keys=diffusion_conditioning["to_keys"],
             r=r_noisy,  # Float['bs m 3'],
             multiplicity=multiplicity,
+            use_flash_attn=use_flash_attn,
+            step_cache=step_cache,
         )
 
         # Full self-attention on token level
@@ -181,6 +198,7 @@ class DiffusionModule(Module):
                 "token_trans_bias"
             ].float(),  # note z is not expanded with multiplicity until after bias is computed
             multiplicity=multiplicity,
+            use_flash_attn=use_flash_attn,
         )
         a = self.a_norm(a)
 
@@ -193,6 +211,8 @@ class DiffusionModule(Module):
             feats=feats,
             multiplicity=multiplicity,
             to_keys=to_keys,
+            use_flash_attn=use_flash_attn,
+            step_cache=step_cache,
         )
 
         return r_update
@@ -368,6 +388,31 @@ class AtomDiffusion(Module):
             device=self.device,
         )
 
+        # Atom-side tensors every step of this roll-out rebuilds identically.
+        # The cache lives and dies with this call, so nothing leaks between
+        # predictions, and it declines tensors too large to hold resident.
+        step_cache = {} if enabled("atom_hoist") else None
+
+        # The trunk half of the single conditioning is the same at every noise
+        # level. Evaluate it once per distinct chunk width instead of once per
+        # step: replicating the inputs first keeps the GEMM shape, and so the
+        # reduction order, exactly the one the per-step call used.
+        s_embedded_by_width = {}
+        if (
+            enabled("dit_hoist")
+            and network_condition_kwargs.get("s_embedded") is None
+            and network_condition_kwargs.get("s_trunk") is not None
+            and network_condition_kwargs.get("s_inputs") is not None
+        ):
+            conditioner = self.score_model.single_conditioner
+            s_trunk_full = network_condition_kwargs["s_trunk"]
+            s_inputs_full = network_condition_kwargs["s_inputs"]
+            for width in {chunk.numel() // batch_size for chunk in sample_id_chunks}:
+                s_embedded_by_width[width] = conditioner.embed_trunk(
+                    s_trunk_full.repeat_interleave(width, 0),
+                    s_inputs_full.repeat_interleave(width, 0),
+                )
+
         if steering_args["fk_steering"]:
             energy_traj = torch.empty((total_samples, 0), device=self.device)
             resample_weights = torch.ones(total_samples, device=self.device).reshape(
@@ -435,13 +480,19 @@ class AtomDiffusion(Module):
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
                 for sample_ids_chunk in sample_id_chunks:
                     chunk_multiplicity = sample_ids_chunk.numel() // batch_size
+                    chunk_kwargs = dict(
+                        multiplicity=chunk_multiplicity,
+                        step_cache=step_cache,
+                        **network_condition_kwargs,
+                    )
+                    if chunk_multiplicity in s_embedded_by_width:
+                        chunk_kwargs["s_embedded"] = s_embedded_by_width[
+                            chunk_multiplicity
+                        ]
                     atom_coords_denoised_chunk = self.preconditioned_network_forward(
                         atom_coords_noisy[sample_ids_chunk],
                         t_hat,
-                        network_condition_kwargs=dict(
-                            multiplicity=chunk_multiplicity,
-                            **network_condition_kwargs,
-                        ),
+                        network_condition_kwargs=chunk_kwargs,
                     )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
 

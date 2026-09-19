@@ -9,6 +9,11 @@ from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import BasePredictionWriter
 from torch import Tensor
 
+from boltz.data.structure_cache import (
+    cache_array,
+    ranked_sample_index,
+    save_structure_cache,
+)
 from boltz.data.types import (
     Coords,
     Interface,
@@ -69,6 +74,7 @@ class BoltzWriter(BasePredictionWriter):
         output_format: Literal["pdb", "mmcif"] = "mmcif",
         boltz2: bool = False,
         write_embeddings: bool = False,
+        experimental_structure_cache: bool = False,
     ) -> None:
         """Initialize the writer.
 
@@ -90,6 +96,7 @@ class BoltzWriter(BasePredictionWriter):
         self.boltz2 = boltz2
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.write_embeddings = write_embeddings
+        self.experimental_structure_cache = experimental_structure_cache
 
     def write_on_batch_end(
         self,
@@ -361,14 +368,25 @@ class BoltzWriter(BasePredictionWriter):
             # Cache the exact trunk state and top-ranked pose for the later
             # affinity-only pass.  The loader must apply the same crop before
             # handing these tensors back to Boltz2.
-            if self.boltz2 and record.affinity and "s" in prediction and "z" in prediction:
+            if (
+                self.experimental_structure_cache
+                and self.boltz2
+                and record.affinity
+                and "s" in prediction
+                and "z" in prediction
+            ):
                 cache_path = struct_dir / f"structure_cache_{record.id}.npz"
-                cached_coords = prediction["coords"][start].cpu().numpy()
-                np.savez_compressed(
+                best_index = ranked_sample_index(
+                    record_idx, samples_per_record, idx_to_rank
+                )
+                token_mask = prediction["token_masks"][record_idx].bool()
+                save_structure_cache(
                     cache_path,
-                    s=prediction["s"][record_idx].cpu().numpy(),
-                    z=prediction["z"][record_idx].cpu().numpy(),
-                    coords=prediction["coords"][record_idx].cpu().numpy(),
+                    record_id=record.id,
+                    structure_path=struct_dir / f"pre_affinity_{record.id}.npz",
+                    s=cache_array(prediction["s"][record_idx][token_mask]),
+                    z=cache_array(prediction["z"][record_idx][token_mask][:, token_mask]),
+                    coords=cache_array(prediction["coords"][best_index][pad_mask.bool()]),
                 )
 
     def on_predict_epoch_end(
@@ -425,6 +443,7 @@ class BoltzAffinityWriter(BasePredictionWriter):
         affinity_summary = {
             "affinity_pred_value": pred_affinity_value.item(),
             "affinity_probability_binary": pred_affinity_probability.item(),
+            "affinity_inference_mode": prediction.get("affinity_inference_mode", "standard"),
         }
         if record.affinity and record.affinity.chain_name:
             affinity_summary["binder_chain"] = record.affinity.chain_name

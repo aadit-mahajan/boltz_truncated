@@ -13,6 +13,7 @@ from boltz.data.crop.affinity import AffinityCropper
 from boltz.data.feature.featurizerv2 import Boltz2Featurizer
 from boltz.data.mol import load_canonicals, load_molecules
 from boltz.data.pad import pad_to_max
+from boltz.data.structure_cache import load_structure_cache
 from boltz.data.tokenize.boltz2 import Boltz2Tokenizer
 from boltz.data.types import (
     MSA,
@@ -168,6 +169,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        experimental_structure_cache: bool = False,
     ) -> None:
         """Initialize the training dataset.
 
@@ -201,6 +203,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        self.experimental_structure_cache = experimental_structure_cache
         if self.affinity:
             self.cropper = AffinityCropper()
 
@@ -236,6 +239,7 @@ class PredictionDataset(torch.utils.data.Dataset):
 
         # Tokenize structure
         tokenized = self.tokenizer.tokenize(input_data)
+        full_token_count = len(tokenized.tokens)
 
         if self.affinity:
             tokenized = self.cropper.crop(
@@ -252,11 +256,12 @@ class PredictionDataset(torch.utils.data.Dataset):
                 / record.id
                 / f"structure_cache_{record.id}.npz"
             )
-            if cache_path.exists():
-                cache = np.load(cache_path)
+            if self.experimental_structure_cache and not cache_path.exists():
+                raise ValueError(
+                    f"No validated structure cache for {record.id}; rerun with --override"
+                )
+            if self.experimental_structure_cache and cache_path.exists():
                 token_ids = tokenized.tokens["token_idx"].astype(np.int64)
-                cached_s = torch.from_numpy(cache["s"])[token_ids]
-                cached_z = torch.from_numpy(cache["z"])[np.ix_(token_ids, token_ids)]
                 atom_ids = np.concatenate([
                     np.arange(atom_idx, atom_idx + atom_num, dtype=np.int64)
                     for atom_idx, atom_num in zip(
@@ -264,8 +269,18 @@ class PredictionDataset(torch.utils.data.Dataset):
                         tokenized.tokens["atom_num"],
                     )
                 ])
-                selected_coords = torch.from_numpy(cache["coords"])[atom_ids]
-                cached_coords = selected_coords
+                cache = load_structure_cache(
+                    cache_path,
+                    record_id=record.id,
+                    structure_path=self.target_dir / record.id / f"pre_affinity_{record.id}.npz",
+                    token_count=full_token_count,
+                    atom_count=len(input_data.structure.atoms),
+                    token_ids=token_ids,
+                    atom_ids=atom_ids,
+                )
+                cached_s = torch.from_numpy(cache["s"])
+                cached_z = torch.from_numpy(cache["z"])
+                cached_coords = torch.from_numpy(cache["coords"])
             else:
                 cached_s = cached_z = cached_coords = None
 
@@ -323,8 +338,15 @@ class PredictionDataset(torch.utils.data.Dataset):
                 (atom_count, 3), dtype=cached_coords.dtype
             )
             padded_coords[: cached_coords.shape[0]] = cached_coords
-            features["cached_s"] = cached_s
-            features["cached_z"] = cached_z
+            token_count = features["token_pad_mask"].shape[0]
+            if cached_s.shape[0] > token_count:
+                raise ValueError("Cached embeddings exceed affinity token axis")
+            padded_s = cached_s.new_zeros((token_count, cached_s.shape[-1]))
+            padded_z = cached_z.new_zeros((token_count, token_count, cached_z.shape[-1]))
+            padded_s[: cached_s.shape[0]] = cached_s
+            padded_z[: cached_z.shape[0], : cached_z.shape[1]] = cached_z
+            features["cached_s"] = padded_s
+            features["cached_z"] = padded_z
             features["cached_coords"] = padded_coords
         return features
 
@@ -357,6 +379,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         override_method: Optional[str] = None,
         affinity: bool = False,
         pin_memory: bool = True,
+        experimental_structure_cache: bool = False,
     ) -> None:
         """Initialize the DataModule.
 
@@ -401,6 +424,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         self.override_method = override_method
         self.affinity = affinity
         self.pin_memory = pin_memory
+        self.experimental_structure_cache = experimental_structure_cache
 
     def predict_dataloader(self) -> DataLoader:
         """Get the training dataloader.
@@ -421,6 +445,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             extra_mols_dir=self.extra_mols_dir,
             override_method=self.override_method,
             affinity=self.affinity,
+            experimental_structure_cache=self.experimental_structure_cache,
         )
         return DataLoader(
             dataset,

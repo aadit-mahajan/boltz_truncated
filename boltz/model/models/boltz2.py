@@ -36,6 +36,7 @@ from boltz.model.modules.trunkv2 import (
 )
 from boltz.model.optim.ema import EMA
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
+from boltz.opt import enabled
 
 
 class Boltz2(LightningModule):
@@ -421,35 +422,35 @@ class Boltz2(LightningModule):
             self.training and self.structure_prediction_training
         ):
             cached = cached_structure is not None
-            s_inputs = self.input_embedder(feats, affinity=cached)
-
-            # Initialize the sequence embeddings
-            s_init = self.s_init(s_inputs)
-
-            # Initialize pairwise embeddings
-            z_init = (
-                self.z_init_1(s_inputs)[:, :, None]
-                + self.z_init_2(s_inputs)[:, None, :]
-            )
-            relative_position_encoding = self.rel_pos(feats)
-            z_init = z_init + relative_position_encoding
-            z_init = z_init + self.token_bonds(feats["token_bonds"].float())
-            if self.bond_type_feature:
-                z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
-            z_init = z_init + self.contact_conditioning(feats)
-
-            # Perform rounds of the pairwise stack
             if cached:
+                if self.training or not self.affinity_prediction:
+                    raise ValueError("Structure cache is only supported for affinity inference")
                 s = cached_structure["s"]
                 z = cached_structure["z"]
                 sample_atom_coords = cached_structure["coords"]
-                if s.ndim == 2:
-                    s = s.unsqueeze(0)
-                # DataLoader collation already supplies the batch dimension.
-                expected = feats["token_pad_mask"].shape[:2]
-                if s.shape[:2] != expected or z.shape[:3] != (*expected, z.shape[2]):
+                batch_size, token_count = feats["token_pad_mask"].shape
+                if (
+                    batch_size != 1
+                    or s.shape != (batch_size, token_count, self.s_init.out_features)
+                    or z.shape != (batch_size, token_count, token_count, self.z_init_1.out_features)
+                    or sample_atom_coords.shape != (*feats["atom_pad_mask"].shape, 3)
+                ):
                     raise ValueError("Cached Boltz-2 latents do not match the affinity crop")
             else:
+                s_inputs = self.input_embedder(feats)
+
+                # Initialize the sequence and pairwise embeddings.
+                s_init = self.s_init(s_inputs)
+                z_init = (
+                    self.z_init_1(s_inputs)[:, :, None]
+                    + self.z_init_2(s_inputs)[:, None, :]
+                )
+                relative_position_encoding = self.rel_pos(feats)
+                z_init = z_init + relative_position_encoding
+                z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+                if self.bond_type_feature:
+                    z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
+                z_init = z_init + self.contact_conditioning(feats)
                 s = torch.zeros_like(s_init)
                 z = torch.zeros_like(z_init)
 
@@ -457,6 +458,12 @@ class Boltz2(LightningModule):
             mask = feats["token_pad_mask"].float()
             pair_mask = mask[:, :, None] * mask[:, None, :]
             if self.run_trunk_and_structure and not cached:
+                # With no real template the module aggregates to zero and its
+                # output projection has no bias, so its update is exactly +0.0.
+                # The check costs one device sync, here rather than per recycle.
+                run_templates = self.use_templates and not (
+                    enabled("templ_skip") and not bool(feats["template_mask"].any())
+                )
                 for i in range(recycling_steps + 1):
                     with torch.set_grad_enabled(
                         self.training
@@ -476,7 +483,7 @@ class Boltz2(LightningModule):
                         z = z_init + self.z_recycle(self.z_norm(z))
 
                         # Compute pairwise stack
-                        if self.use_templates:
+                        if run_templates:
                             if self.is_template_compiled and not self.training:
                                 template_module = self.template_module._orig_mod  # noqa: SLF001
                             else:
@@ -514,12 +521,12 @@ class Boltz2(LightningModule):
                             use_flash_attn=self.use_flash_attn,
                         )
 
-            pdistogram = self.distogram_module(z)
             dict_out = {
-                "pdistogram": pdistogram,
                 "s": s,
                 "z": z,
             }
+            if not cached:
+                dict_out["pdistogram"] = self.distogram_module(z)
 
             if (
                 self.run_trunk_and_structure
@@ -567,15 +574,16 @@ class Boltz2(LightningModule):
                         max_parallel_samples=max_parallel_samples,
                         steering_args=self.steering_args,
                         diffusion_conditioning=diffusion_conditioning,
+                        use_flash_attn=self.use_flash_attn,
                     )
                     dict_out.update(struct_out)
-
-            elif cached:
-                dict_out["sample_atom_coords"] = sample_atom_coords
 
                 if self.predict_bfactor:
                     pbfactor = self.bfactor_module(s)
                     dict_out["pbfactor"] = pbfactor
+
+            elif cached:
+                dict_out["sample_atom_coords"] = sample_atom_coords
 
             if self.training and self.confidence_prediction:
                 assert len(feats["coords"].shape) == 4
@@ -1088,6 +1096,15 @@ class Boltz2(LightningModule):
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> dict:
         try:
+            cache_keys = {"cached_s", "cached_z", "cached_coords"}
+            present_cache_keys = cache_keys.intersection(batch)
+            if present_cache_keys and (
+                present_cache_keys != cache_keys
+                or not self.predict_args.get("experimental_structure_cache", False)
+            ):
+                raise ValueError(
+                    "A complete structure cache requires explicit experimental_structure_cache opt-in"
+                )
             out = self(
                 batch,
                 recycling_steps=self.predict_args["recycling_steps"],
@@ -1148,6 +1165,9 @@ class Boltz2(LightningModule):
                     pred_dict["protein_iptm"] = out["protein_iptm"]
                     pred_dict["pair_chains_iptm"] = out["pair_chains_iptm"]
             if self.affinity_prediction:
+                pred_dict["affinity_inference_mode"] = (
+                    "experimental_structure_cache" if present_cache_keys else "standard"
+                )
                 pred_dict["affinity_pred_value"] = out["affinity_pred_value"]
                 pred_dict["affinity_probability_binary"] = out[
                     "affinity_probability_binary"

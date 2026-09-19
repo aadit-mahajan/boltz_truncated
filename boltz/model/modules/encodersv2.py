@@ -11,7 +11,7 @@ from torch.nn.functional import one_hot
 import boltz.model.layers.initialize as init
 from boltz.model.layers.transition import Transition
 from boltz.model.modules.transformersv2 import AtomTransformer
-from boltz.model.modules.utils import LinearNoBias, autocast_device_type
+from boltz.model.modules.utils import LinearNoBias, autocast_device_type, memo
 
 
 class FourierEmbedding(Module):
@@ -154,14 +154,31 @@ class SingleConditioning(Module):
 
         self.transitions = transitions
 
+    def embed_trunk(
+        self,
+        s_trunk,  # Float['b n ts'],
+        s_inputs,  # Float['b n ts'],
+    ):  # -> Float['b n 2ts']:
+        """The half of the conditioning that does not depend on the noise level.
+
+        ``norm_single`` and ``single_embed`` are both per-token, so evaluating
+        them once on the unreplicated batch and repeating the result is bitwise
+        what the per-step call produced from a replicated input. The diffusion
+        sampler caches this and reuses it across every step of every sample.
+        """
+        return self.single_embed(self.norm_single(torch.cat((s_trunk, s_inputs), dim=-1)))
+
     def forward(
         self,
         times,  # Float[' b'],
         s_trunk,  # Float['b n ts'],
         s_inputs,  # Float['b n ts'],
+        s_embedded=None,  # Float['b n 2ts'], the cached embed_trunk output
     ):  # -> Float['b n 2ts']:
-        s = torch.cat((s_trunk, s_inputs), dim=-1)
-        s = self.single_embed(self.norm_single(s))
+        if s_embedded is None:
+            s = self.embed_trunk(s_trunk, s_inputs)
+        else:
+            s = s_embedded
         if not self.disable_times:
             fourier_embed = self.fourier_embed(
                 times
@@ -456,18 +473,29 @@ class AtomAttentionEncoder(Module):
         to_keys,
         r=None,  # Float['bm m 3'],
         multiplicity=1,
+        use_flash_attn=False,
+        step_cache=None,
     ):
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"].bool()  # Bool['b m'],
 
         if self.structure_prediction:
             # only here the multiplicity kicks in because we use the different positions r
-            q = q.repeat_interleave(multiplicity, 0)
+            q_replicated = memo(
+                step_cache, ("enc_q", multiplicity),
+                lambda: q.repeat_interleave(multiplicity, 0),
+            )
             r_to_q = self.r_to_q_trans(r)
-            q = q + r_to_q
+            # Not in place: q_replicated may be the cache's own tensor.
+            q = q_replicated + r_to_q
 
-        c = c.repeat_interleave(multiplicity, 0)
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        # Everything below is the same tensor at every diffusion step, so the
+        # sampler's per-roll-out cache keeps it instead of rebuilding it.
+        c = memo(step_cache, ("enc_c", multiplicity), lambda: c.repeat_interleave(multiplicity, 0))
+        atom_mask = memo(
+            step_cache, ("atom_mask", multiplicity),
+            lambda: atom_mask.repeat_interleave(multiplicity, 0),
+        )
 
         q = self.atom_encoder(
             q=q,
@@ -476,14 +504,18 @@ class AtomAttentionEncoder(Module):
             bias=atom_enc_bias,
             multiplicity=multiplicity,
             to_keys=to_keys,
+            use_flash_attn=use_flash_attn,
         )
 
         with torch.autocast(autocast_device_type(q.device.type), enabled=False):
             q_to_a = self.atom_to_token_trans(q).float()
-            atom_to_token = feats["atom_to_token"].float()
-            atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
-            atom_to_token_mean = atom_to_token / (
-                atom_to_token.sum(dim=1, keepdim=True) + 1e-6
+            atom_to_token = memo(
+                step_cache, ("atom_to_token", multiplicity),
+                lambda: feats["atom_to_token"].float().repeat_interleave(multiplicity, 0),
+            )
+            atom_to_token_mean = memo(
+                step_cache, ("atom_to_token_mean", multiplicity),
+                lambda: atom_to_token / (atom_to_token.sum(dim=1, keepdim=True) + 1e-6),
             )
             a = torch.bmm(atom_to_token_mean.transpose(1, 2), q_to_a)
 
@@ -540,17 +572,24 @@ class AtomAttentionDecoder(Module):
         feats,
         to_keys,
         multiplicity=1,
+        use_flash_attn=False,
+        step_cache=None,
     ):
         with torch.autocast(autocast_device_type(a.device.type), enabled=False):
-            atom_to_token = feats["atom_to_token"].float()
-            atom_to_token = atom_to_token.repeat_interleave(multiplicity, 0)
+            # The same replicated mapping the encoder built this step.
+            atom_to_token = memo(
+                step_cache, ("atom_to_token", multiplicity),
+                lambda: feats["atom_to_token"].float().repeat_interleave(multiplicity, 0),
+            )
 
             a_to_q = self.a_to_q_trans(a.float())
             a_to_q = torch.bmm(atom_to_token, a_to_q)
 
         q = q + a_to_q.to(q)
-        atom_mask = feats["atom_pad_mask"]  # Bool['b m'],
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        atom_mask = memo(
+            step_cache, ("atom_pad_mask", multiplicity),
+            lambda: feats["atom_pad_mask"].repeat_interleave(multiplicity, 0),
+        )
 
         q = self.atom_decoder(
             q=q,
@@ -559,6 +598,7 @@ class AtomAttentionDecoder(Module):
             bias=atom_dec_bias,
             multiplicity=multiplicity,
             to_keys=to_keys,
+            use_flash_attn=use_flash_attn,
         )
 
         r_update = self.atom_feat_to_atom_pos_update(q)

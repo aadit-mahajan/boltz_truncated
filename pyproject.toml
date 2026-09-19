@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boltz-community"
-version = "0.1.0"
-description = "Boltz-2 cached-latent affinity inference fork"
-requires-python = ">=3.10"
+version = "0.2.0"
+description = "Boltz-2 inference with optimization profiles and structure-cache affinity"
+requires-python = ">=3.10,<3.13"
 dependencies = [
   "torch>=2.2",
   "numpy>=1.26",
@@ -33,5 +33,12 @@ dependencies = [
 [project.scripts]
 boltz = "boltz.main:cli"
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [tool.setuptools.packages.find]
-include = ["boltz*"]
+include = ["boltz", "boltz.*"]
+exclude = ["build*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -102,6 +102,7 @@ class DiffusionTransformer(Module):
         mask=None,  # Bool['b n'] | None = None
         to_keys=None,
         multiplicity=1,
+        use_flash_attn=False,
     ):
         if self.pair_bias_attn:
             B, N, M, D = bias.shape
@@ -123,6 +124,7 @@ class DiffusionTransformer(Module):
                     mask,
                     to_keys,
                     multiplicity,
+                    use_flash_attn,
                 )
 
             else:
@@ -133,6 +135,7 @@ class DiffusionTransformer(Module):
                     mask,  # Bool['b n'] | None = None
                     to_keys,
                     multiplicity,
+                    use_flash_attn,
                 )
         return a
 
@@ -180,6 +183,7 @@ class DiffusionTransformerLayer(Module):
         mask=None,  # Bool['b n'] | None = None
         to_keys=None,
         multiplicity=1,
+        use_flash_attn=False,
     ):
         b = self.adaln(a, s)
 
@@ -195,6 +199,7 @@ class DiffusionTransformerLayer(Module):
                 mask=mask,
                 multiplicity=multiplicity,
                 k_in=k_in,
+                use_flash_attn=use_flash_attn,
             )
         else:
             b = self.no_pair_bias_attn(s=b, mask=mask, k_in=k_in)
@@ -232,6 +237,7 @@ class AtomTransformer(Module):
         to_keys,
         mask,  # Bool['b m'] | None = None
         multiplicity=1,
+        use_flash_attn=False,
     ):
         W = self.attn_window_queries
         H = self.attn_window_keys
@@ -256,6 +262,7 @@ class AtomTransformer(Module):
             mask=mask.float(),
             multiplicity=1, # bias term already expanded with multiplicity
             to_keys=to_keys_new,
+            use_flash_attn=use_flash_attn,
         )
 
         q = q.view((B, NW * W, D))

@@ -16,6 +16,8 @@ import click
 
 from importlib.metadata import version as _pkg_version
 
+from boltz import opt
+
 try:
     from pytorch_lightning.utilities import rank_zero_only
 except ImportError:
@@ -474,7 +476,6 @@ def filter_inputs_structure(
                 keep.append(r)
             elif r.affinity and not (
                 (pred_dir / r.id / f"pre_affinity_{r.id}.npz").exists()
-                or (pred_dir / r.id / f"structure_cache_{r.id}.npz").exists()
             ):
                 # Prior run created the directory but failed to write
                 # the pre_affinity file needed for the affinity pass
@@ -498,6 +499,7 @@ def filter_inputs_affinity(
     manifest: Manifest,
     outdir: Path,
     override: bool = False,
+    experimental_structure_cache: bool = False,
 ) -> Manifest:
     """Check the input data and output directory for affinity.
 
@@ -526,10 +528,25 @@ def filter_inputs_affinity(
         output_id = get_affinity_output_id(record)
         return pred_dir / record.id / f"affinity_{output_id}.json"
 
+    expected_mode = "experimental_structure_cache" if experimental_structure_cache else "standard"
+
+    def reusable_affinity_output(record):
+        path = affinity_output_path(record)
+        if not path.exists():
+            return False
+        try:
+            with path.open() as handle:
+                summary = json.load(handle)
+            # Older versions silently reused unvalidated structure caches, so
+            # unlabelled affinity outputs cannot establish their inference mode.
+            return summary.get("affinity_inference_mode") == expected_mode
+        except (OSError, ValueError):
+            return False
+
     existing = [
         record
         for record in manifest.records
-        if record.affinity and affinity_output_path(record).exists()
+        if record.affinity and reusable_affinity_output(record)
     ]
 
     # Remove them from the input data
@@ -562,7 +579,6 @@ def filter_inputs_affinity(
         if r.affinity
         and not (
             (pred_dir / r.id / f"pre_affinity_{r.id}.npz").exists()
-            or (pred_dir / r.id / f"structure_cache_{r.id}.npz").exists()
         )
     ]
     if missing:
@@ -1347,6 +1363,39 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
     ),
 )
 @click.option(
+    "--experimental_structure_cache",
+    is_flag=True,
+    default=False,
+    help=(
+        "Experimental approximate affinity mode: reuse the selected structure pose "
+        "and cropped full-complex trunk states, skipping the affinity trunk, diffusion "
+        "and confidence passes. This changes the affinity inference workflow and has "
+        "not been validated for accuracy. Existing structures need --override to "
+        "generate a validated cache. Default: disabled."
+    ),
+)
+@click.option(
+    "--opt_profile",
+    type=click.Choice(sorted(opt.PROFILES)),
+    default=opt.DEFAULT_PROFILE,
+    show_default=True,
+    help=(
+        "Inference optimization profile. 'off' is stock Boltz-2; 'exact' keeps "
+        "only the levers whose arithmetic is identical to stock; 'fast' adds "
+        "SDPA attention, fused diffusion-conditioning projections, TF32 and "
+        "float16 structure-cache storage, which move results within Boltz-2's "
+        "own seed-to-seed variation. See OPTIMIZATIONS.md."
+    ),
+)
+@click.option(
+    "--disable_opt",
+    default="",
+    help=(
+        "Comma-separated optimization levers to switch off within the chosen "
+        "profile, for A/B testing a single change. Unknown names are an error."
+    ),
+)
+@click.option(
     "--write_embeddings",
     is_flag=True,
     help="Whether to dump the s and z embeddings into a npz file.",
@@ -1392,8 +1441,23 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     no_kernels: bool,
     flash_attn: bool,
     write_embeddings: bool,
+    opt_profile: str = opt.DEFAULT_PROFILE,
+    disable_opt: str = "",
+    experimental_structure_cache: bool = False,
 ) -> None:
     """Run predictions with Boltz."""
+    # Resolve the profile first: the expandable-segments allocator is parsed at
+    # the first CUDA allocation and cannot be changed after that.
+    try:
+        levers = opt.configure(
+            opt_profile,
+            tuple(name.strip() for name in disable_opt.split(",") if name.strip()),
+        )
+    except opt.ProfileError as error:
+        raise click.UsageError(str(error)) from error
+    opt.prepare_allocator()
+    click.echo(opt.describe())
+
     import torch
     from pytorch_lightning import Trainer, seed_everything
     from pytorch_lightning.strategies import DDPStrategy
@@ -1404,8 +1468,20 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
     from boltz.data.types import Manifest
     from boltz.data.write.writer import BoltzAffinityWriter, BoltzWriter
+    from boltz.model.layers.initialize import skip_parameter_init
     from boltz.model.models.boltz1 import Boltz1
     from boltz.model.models.boltz2 import Boltz2
+
+    # --flash_attn stays an independent switch so it can be used under 'exact'.
+    flash_attn = flash_attn or "flash_attn" in levers
+
+    if experimental_structure_cache and model != "boltz2":
+        raise click.UsageError("--experimental_structure_cache requires --model boltz2")
+    if experimental_structure_cache:
+        click.echo(
+            "Experimental structure-cache affinity mode changes the model workflow; "
+            "its accuracy requires separate validation."
+        )
 
     # PyTorch 2.6+ defaults torch.load to weights_only=True, which rejects
     # Lightning checkpoints containing OmegaConf config objects and custom types.
@@ -1419,6 +1495,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
         _patched_load._boltz_patched = True  # type: ignore[attr-defined]
         torch.load = _patched_load  # type: ignore[assignment]
+
+    for knob in opt.apply_runtime_knobs(accelerator):
+        click.echo(f"[boltz-opt] runtime {knob}")
 
     # If cpu, write a friendly warning
     if accelerator == "cpu":
@@ -1632,6 +1711,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         output_format=output_format,
         boltz2=model == "boltz2",
         write_embeddings=write_embeddings,
+        experimental_structure_cache=experimental_structure_cache,
     )
 
     # MPS and CPU do not support bf16-mixed
@@ -1721,19 +1801,22 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             _validate_checkpoint_for_load(checkpoint, "Boltz-2 weights")
         else:
             _validate_checkpoint_for_load(checkpoint, "Boltz-1 weights")
-        model_module = model_cls.load_from_checkpoint(
-            checkpoint,
-            strict=True,
-            predict_args=predict_args,
-            map_location=map_location,
-            diffusion_process_args=asdict(diffusion_params),
-            ema=False,
-            use_kernels=not no_kernels,
-            use_flash_attn=flash_attn,
-            pairformer_args=asdict(pairformer_args),
-            msa_args=asdict(msa_args),
-            steering_args=asdict(steering_args),
-        )
+        # Building the model samples every weight; the strict load below then
+        # overwrites all of it, so under `ctorskip` it is not sampled at all.
+        with skip_parameter_init():
+            model_module = model_cls.load_from_checkpoint(
+                checkpoint,
+                strict=True,
+                predict_args=predict_args,
+                map_location=map_location,
+                diffusion_process_args=asdict(diffusion_params),
+                ema=False,
+                use_kernels=not no_kernels,
+                use_flash_attn=flash_attn,
+                pairformer_args=asdict(pairformer_args),
+                msa_args=asdict(msa_args),
+                steering_args=asdict(steering_args),
+            )
         model_module.eval()
 
         # Compute structure predictions
@@ -1762,6 +1845,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             manifest=manifest_affinity,
             outdir=out_dir,
             override=override,
+            experimental_structure_cache=experimental_structure_cache,
         )
         if not manifest_filtered.records:
             click.echo("Found existing affinity predictions for all inputs, skipping.")
@@ -1793,6 +1877,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             override_method="other",
             affinity=True,
             pin_memory=pin_memory,
+            experimental_structure_cache=experimental_structure_cache,
         )
 
         predict_affinity_args = {
@@ -1806,6 +1891,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "write_confidence_summary": False,
             "write_full_pae": False,
             "write_full_pde": False,
+            "experimental_structure_cache": experimental_structure_cache,
         }
 
         # Load affinity model
@@ -1821,18 +1907,21 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         _validate_checkpoint_for_load(
             affinity_checkpoint, "Boltz-2 affinity weights"
         )
-        model_module = Boltz2.load_from_checkpoint(
-            affinity_checkpoint,
-            strict=True,
-            predict_args=predict_affinity_args,
-            map_location=map_location,
-            diffusion_process_args=asdict(diffusion_params),
-            ema=False,
-            pairformer_args=asdict(pairformer_args),
-            msa_args=asdict(msa_args),
-            steering_args=asdict(steering_args),
-            affinity_mw_correction=affinity_mw_correction,
-        )
+        with skip_parameter_init():
+            model_module = Boltz2.load_from_checkpoint(
+                affinity_checkpoint,
+                strict=True,
+                predict_args=predict_affinity_args,
+                map_location=map_location,
+                diffusion_process_args=asdict(diffusion_params),
+                ema=False,
+                pairformer_args=asdict(pairformer_args),
+                msa_args=asdict(msa_args),
+                steering_args=asdict(steering_args),
+                affinity_mw_correction=affinity_mw_correction,
+                use_kernels=not no_kernels,
+                use_flash_attn=flash_attn,
+            )
         model_module.eval()
 
         trainer.callbacks[0] = pred_writer

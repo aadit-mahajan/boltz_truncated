@@ -314,3 +314,27 @@ def random_rotations(
     """
     quaternions = random_quaternions(n, dtype=dtype, device=device)
     return quaternion_to_matrix(quaternions)
+
+
+#: A hoisted tensor above this size is rebuilt per step instead of held for the
+#: whole roll-out. Stock allocates and frees it each step, so declining to cache
+#: it costs only the work stock already does, while caching a multi-gigabyte
+#: atom<->token matrix could push a large input out of memory.
+MEMO_MAX_BYTES = 256 * 1024**2
+
+
+def memo(cache, key, build):
+    """Return ``build()``, reusing the value ``cache`` already holds for ``key``.
+
+    ``cache`` is None when the caller does not want memoization, which makes
+    this the identity. The value is the *same tensor object* on every hit, so a
+    consumer sees bitwise what recomputing would have produced.
+    """
+    if cache is None:
+        return build()
+    if key in cache:
+        return cache[key]
+    value = build()
+    if value.numel() * value.element_size() <= MEMO_MAX_BYTES:
+        cache[key] = value
+    return value

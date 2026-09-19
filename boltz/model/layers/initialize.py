@@ -15,11 +15,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 
 import numpy as np
 import torch
 from scipy.stats import truncnorm
+
+from boltz.opt import enabled
 
 
 def _prod(nums):
@@ -98,3 +101,53 @@ def ipa_point_weights_init_(weights):
     with torch.no_grad():
         softplus_inverse_1 = 0.541324854612918
         weights.fill_(softplus_inverse_1)
+
+
+#: Initializers this module owns. ``lecun_normal_init_`` and ``he_normal_init_``
+#: sample through scipy, which is by far the most expensive of them.
+_OWN_INITIALIZERS = (
+    "trunc_normal_init_", "lecun_normal_init_", "he_normal_init_",
+    "glorot_uniform_init_", "final_init_", "gating_init_", "bias_init_zero_",
+    "bias_init_one_", "normal_init_", "ipa_point_weights_init_",
+)
+
+#: torch modules whose ``reset_parameters`` writes only registered parameters.
+_RESET_PARAMETER_TYPES = (
+    torch.nn.Linear, torch.nn.Embedding, torch.nn.LayerNorm,
+    torch.nn.Conv1d, torch.nn.Conv2d,
+)
+
+
+@contextlib.contextmanager
+def skip_parameter_init():
+    """Build modules without initializing weights a checkpoint will overwrite.
+
+    Constructing Boltz-2 samples every weight in the model — including four
+    scipy truncated normals — and a ``strict=True`` checkpoint load then writes
+    over all of it. Inside this context those writes do not happen, so the
+    parameters come out of ``torch.empty`` and the load fills them. The result
+    is identical *provided* the load is strict, which is the only place this is
+    used: strict loading fails by name on any parameter the checkpoint does not
+    supply, so an uninitialized tensor can never reach a forward pass.
+
+    Never use this around a model that will be trained from scratch.
+    """
+    if not enabled("ctorskip"):
+        yield
+        return
+
+    module = globals()
+    saved = {name: module[name] for name in _OWN_INITIALIZERS}
+    saved_resets = {
+        cls: cls.reset_parameters for cls in _RESET_PARAMETER_TYPES
+    }
+    try:
+        for name in _OWN_INITIALIZERS:
+            module[name] = lambda *args, **kwargs: None
+        for cls in _RESET_PARAMETER_TYPES:
+            cls.reset_parameters = lambda self: None
+        yield
+    finally:
+        module.update(saved)
+        for cls, reset in saved_resets.items():
+            cls.reset_parameters = reset

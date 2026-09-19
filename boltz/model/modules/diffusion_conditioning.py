@@ -8,6 +8,8 @@ from boltz.model.modules.encodersv2 import (
     AtomEncoder,
     PairwiseConditioning,
 )
+from boltz.model.modules.fused import fused_stack
+from boltz.opt import enabled
 
 
 class DiffusionConditioning(Module):
@@ -98,19 +100,20 @@ class DiffusionConditioning(Module):
             z=z,  # Float['b n n tz'],
         )
 
-        atom_enc_bias = []
-        for layer in self.atom_enc_proj_z:
-            atom_enc_bias.append(layer(p))
-        atom_enc_bias = torch.cat(atom_enc_bias, dim=-1)
-
-        atom_dec_bias = []
-        for layer in self.atom_dec_proj_z:
-            atom_dec_bias.append(layer(p))
-        atom_dec_bias = torch.cat(atom_dec_bias, dim=-1)
-
-        token_trans_bias = []
-        for layer in self.token_trans_proj_z:
-            token_trans_bias.append(layer(z))
-        token_trans_bias = torch.cat(token_trans_bias, dim=-1)
+        atom_enc_bias = self._project(self.atom_enc_proj_z, "atom_enc", p)
+        atom_dec_bias = self._project(self.atom_dec_proj_z, "atom_dec", p)
+        token_trans_bias = self._project(self.token_trans_proj_z, "token_trans", z)
 
         return q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias
+
+    def _project(self, layers, name, x):
+        """Concatenated bias for one projection stack, fused where allowed.
+
+        The fused path normalizes ``x`` once and runs a single GEMM against the
+        stacked weights; the fallback is stock's loop over the layers.
+        """
+        if enabled("condproj"):
+            fused = fused_stack(self, name, layers)
+            if fused is not None:
+                return fused(x)
+        return torch.cat([layer(x) for layer in layers], dim=-1)

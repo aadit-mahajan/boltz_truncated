@@ -1,0 +1,15 @@
+{
+  "upstream": {
+    "repository": "https://github.com/jwohlwend/boltz.git",
+    "version": "2.2.1",
+    "commit": "cb04aeccdd480fd4db707f0bbafde538397fa2ac",
+    "reviewed_main_commit": "b1ebfc46ecf57f5414e0d1a6f9027bbb122c53bc"
+  },
+  "original_fork_commit": "6486af4201f54539efde0a926e6656a3e0870b41",
+  "runtime": {
+    "min_compute_capability": [
+      8,
+      0
+    ]
+  }
+}
